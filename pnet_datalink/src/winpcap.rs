@@ -24,6 +24,7 @@ use std::mem;
 use std::slice;
 use std::str::from_utf8_unchecked;
 use std::sync::Arc;
+use std::time::Duration;
 
 struct WinPcapAdapter {
     adapter: winpcap::LPADAPTER,
@@ -57,6 +58,9 @@ pub struct Config {
 
     /// The size of buffer to use when reading packets. Defaults to 4096
     pub read_buffer_size: usize,
+
+    /// The read timeout. Defaults to None.
+    pub read_timeout: Option<Duration>,
 }
 
 impl<'a> From<&'a super::Config> for Config {
@@ -64,6 +68,7 @@ impl<'a> From<&'a super::Config> for Config {
         Config {
             write_buffer_size: config.write_buffer_size,
             read_buffer_size: config.read_buffer_size,
+            read_timeout: config.read_timeout,
         }
     }
 }
@@ -73,8 +78,13 @@ impl Default for Config {
         Config {
             write_buffer_size: 4096,
             read_buffer_size: 4096,
+            read_timeout: None,
         }
     }
+}
+
+fn duration_to_msecs(dur: Duration) -> i32 {
+    (dur.as_secs() * 1000 + (dur.subsec_nanos() / 1000000) as u64) as i32
 }
 
 /// Create a datalink channel using the WinPcap library
@@ -105,6 +115,14 @@ pub fn channel(network_interface: &NetworkInterface,
     let ret = unsafe { winpcap::PacketSetBuff(adapter, config.read_buffer_size as libc::c_int) };
     if ret == 0 {
         return Err(io::Error::last_os_error());
+    }
+
+    // Set read timeout
+    if let Some(read_timeout) = config.read_timeout {
+        let ret = unsafe { winpcap::PacketSetReadTimeout(adapter, duration_to_msecs(read_timeout)) };
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
 
     // Immediate mode
@@ -232,7 +250,7 @@ unsafe impl Sync for DataLinkReceiverImpl {}
 impl DataLinkReceiver for DataLinkReceiverImpl {
     fn next(&mut self) -> io::Result<&[u8]> {
         // NOTE Most of the logic here is identical to FreeBSD/OS X
-        while self.packets.is_empty() {
+        if self.packets.is_empty() {
             let ret = unsafe {
                 winpcap::PacketReceivePacket(self.adapter.adapter, self.packet.packet, 0)
             };
@@ -253,12 +271,16 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
                 }
             }
         }
-        let (start, len) = self.packets.pop_front().unwrap();
-        let slice = unsafe {
-            let data = (*self.packet.packet).Buffer as usize + start;
-            slice::from_raw_parts(data as *const u8, len)
-        };
-        Ok(slice)
+
+        if let Some((start, len)) = self.packets.pop_front() {
+            let slice = unsafe {
+                let data = (*self.packet.packet).Buffer as usize + start;
+                slice::from_raw_parts(data as *const u8, len)
+            };
+            Ok(slice)
+        } else {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out"))
+        }
     }
 }
 
